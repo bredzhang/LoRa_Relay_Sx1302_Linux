@@ -1,16 +1,9 @@
 /*
- / _____)             _              | |
-( (____  _____ ____ _| |_ _____  ____| |__
- \____ \| ___ |    (_   _) ___ |/ ___)  _ \
- _____) ) ____| | | || |_| ____( (___| | | |
-(______/|_____)_|_|_| \__)_____)\____)_| |_|
-  (C)2019 Semtech
-
 Description:
     Configure Lora concentrator and forward packets to a server
     Use GPS for packet timestamping.
     Send a becon at a regular interval without server intervention
-
+    Relaying
 License: Revised BSD License, see LICENSE.TXT file include in the project
 */
 
@@ -279,6 +272,7 @@ static int get_tx_gain_lut_index(uint8_t rf_chain, int8_t rf_power, uint8_t * lu
 void thread_up(void);
 void thread_down(void);
 void thread_jit(void);
+void thread_relay(void);
 void thread_gps(void);
 void thread_valid(void);
 
@@ -3073,8 +3067,524 @@ void thread_jit(void) {
     }
 }
 
+
+
 /* -------------------------------------------------------------------------- */
-/* --- THREAD 4: PARSE GPS MESSAGE AND KEEP GATEWAY IN SYNC ----------------- */
+/* --- THREAD 4: RECEIVING PACKETS AND RELAY THEM ---------------------- */
+
+void thread_relay(void) {
+    int i, j, k; /* loop variables */
+    unsigned pkt_in_dgram; /* nb on Lora packet in the current datagram */
+    char stat_timestamp[24];
+    time_t t;
+
+    /* allocate memory for packet fetching and processing */
+    struct lgw_pkt_rx_s rxpkt[NB_PKT_MAX]; /* array containing inbound packets + metadata */
+    struct lgw_pkt_rx_s *p; /* pointer on a RX packet */
+    int nb_pkt;
+
+    /* local copy of GPS time reference */
+    bool ref_ok = false; /* determine if GPS time reference must be used or not */
+    struct tref local_ref; /* time reference used for UTC <-> timestamp conversion */
+
+    /* data buffers */
+    uint8_t buff_up[TX_BUFF_SIZE]; /* buffer to compose the upstream packet */
+    int buff_index;
+    uint8_t buff_ack[32]; /* buffer to receive acknowledges */
+
+    /* protocol variables */
+    uint8_t token_h; /* random token for acknowledgement matching */
+    uint8_t token_l; /* random token for acknowledgement matching */
+
+    /* ping measurement variables */
+    struct timespec send_time;
+    struct timespec recv_time;
+
+    /* GPS synchronization variables */
+    struct timespec pkt_utc_time;
+    struct tm * x; /* broken-up UTC time */
+    struct timespec pkt_gps_time;
+    uint64_t pkt_gps_time_ms;
+
+    /* report management variable */
+    bool send_report = false;
+
+    /* mote info variables */
+    uint32_t mote_addr = 0;
+    uint16_t mote_fcnt = 0;
+
+    /* set upstream socket RX timeout */
+    i = setsockopt(sock_up, SOL_SOCKET, SO_RCVTIMEO, (void *)&push_timeout_half, sizeof push_timeout_half);
+    if (i != 0) {
+        MSG("ERROR: [up] setsockopt returned %s\n", strerror(errno));
+        exit(EXIT_FAILURE);
+    }
+
+    /* pre-fill the data buffer with fixed fields */
+    buff_up[0] = PROTOCOL_VERSION;
+    buff_up[3] = PKT_PUSH_DATA;
+    *(uint32_t *)(buff_up + 4) = net_mac_h;
+    *(uint32_t *)(buff_up + 8) = net_mac_l;
+
+    while (!exit_sig && !quit_sig) {
+        /* fetch packets */
+        pthread_mutex_lock(&mx_concent);
+        nb_pkt = lgw_receive(NB_PKT_MAX, rxpkt);
+        pthread_mutex_unlock(&mx_concent);
+        if (nb_pkt == LGW_HAL_ERROR) {
+            MSG("ERROR: [up] failed packet fetch, exiting\n");
+            exit(EXIT_FAILURE);
+        }
+
+        /* check if there are status report to send */
+        send_report = report_ready; /* copy the variable so it doesn't change mid-function */
+        /* no mutex, we're only reading */
+
+        /* wait a short time if no packets, nor status report */
+        if ((nb_pkt == 0) && (send_report == false)) {
+            wait_ms(FETCH_SLEEP_MS);
+            continue;
+        }
+
+        /* get a copy of GPS time reference (avoid 1 mutex per packet) */
+        if ((nb_pkt > 0) && (gps_enabled == true)) {
+            pthread_mutex_lock(&mx_timeref);
+            ref_ok = gps_ref_valid;
+            local_ref = time_reference_gps;
+            pthread_mutex_unlock(&mx_timeref);
+        } else {
+            ref_ok = false;
+        }
+
+        /* get timestamp for statistics */
+        t = time(NULL);
+        strftime(stat_timestamp, sizeof stat_timestamp, "%F %T %Z", gmtime(&t));
+        MSG_DEBUG(DEBUG_PKT_FWD, "\nCurrent time: %s \n", stat_timestamp);
+
+        /* start composing datagram with the header */
+        token_h = (uint8_t)rand(); /* random token */
+        token_l = (uint8_t)rand(); /* random token */
+        buff_up[1] = token_h;
+        buff_up[2] = token_l;
+        buff_index = 12; /* 12-byte header */
+
+        /* start of JSON structure */
+        memcpy((void *)(buff_up + buff_index), (void *)"{\"rxpk\":[", 9);
+        buff_index += 9;
+
+        /* serialize Lora packets metadata and payload */
+        pkt_in_dgram = 0;
+        for (i = 0; i < nb_pkt; ++i) {
+            p = &rxpkt[i];
+
+            /* Get mote information from current packet (addr, fcnt) */
+            /* FHDR - DevAddr */
+            if (p->size >= 8) {
+                mote_addr  = p->payload[1];
+                mote_addr |= p->payload[2] << 8;
+                mote_addr |= p->payload[3] << 16;
+                mote_addr |= p->payload[4] << 24;
+                /* FHDR - FCnt */
+                mote_fcnt  = p->payload[6];
+                mote_fcnt |= p->payload[7] << 8;
+            } else {
+                mote_addr = 0;
+                mote_fcnt = 0;
+            }
+
+            /* basic packet filtering */
+            pthread_mutex_lock(&mx_meas_up);
+            meas_nb_rx_rcv += 1;
+            switch(p->status) {
+                case STAT_CRC_OK:
+                    meas_nb_rx_ok += 1;
+                    if (!fwd_valid_pkt) {
+                        pthread_mutex_unlock(&mx_meas_up);
+                        continue; /* skip that packet */
+                    }
+                    break;
+                case STAT_CRC_BAD:
+                    meas_nb_rx_bad += 1;
+                    if (!fwd_error_pkt) {
+                        pthread_mutex_unlock(&mx_meas_up);
+                        continue; /* skip that packet */
+                    }
+                    break;
+                case STAT_NO_CRC:
+                    meas_nb_rx_nocrc += 1;
+                    if (!fwd_nocrc_pkt) {
+                        pthread_mutex_unlock(&mx_meas_up);
+                        continue; /* skip that packet */
+                    }
+                    break;
+                default:
+                    MSG("WARNING: [up] received packet with unknown status %u (size %u, modulation %u, BW %u, DR %u, RSSI %.1f)\n", p->status, p->size, p->modulation, p->bandwidth, p->datarate, p->rssic);
+                    pthread_mutex_unlock(&mx_meas_up);
+                    continue; /* skip that packet */
+                    // exit(EXIT_FAILURE);
+            }
+            meas_up_pkt_fwd += 1;
+            meas_up_payload_byte += p->size;
+            pthread_mutex_unlock(&mx_meas_up);
+            printf( "\nINFO: Received pkt from mote: %08X (fcnt=%u)\n", mote_addr, mote_fcnt );
+
+            /* Start of packet, add inter-packet separator if necessary */
+            if (pkt_in_dgram == 0) {
+                buff_up[buff_index] = '{';
+                ++buff_index;
+            } else {
+                buff_up[buff_index] = ',';
+                buff_up[buff_index+1] = '{';
+                buff_index += 2;
+            }
+
+            /* JSON rxpk frame format version, 8 useful chars */
+            j = snprintf((char *)(buff_up + buff_index), TX_BUFF_SIZE-buff_index, "\"jver\":%d", PROTOCOL_JSON_RXPK_FRAME_FORMAT );
+            if (j > 0) {
+                buff_index += j;
+            } else {
+                MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                exit(EXIT_FAILURE);
+            }
+
+            /* RAW timestamp, 8-17 useful chars */
+            j = snprintf((char *)(buff_up + buff_index), TX_BUFF_SIZE-buff_index, ",\"tmst\":%u", p->count_us);
+            if (j > 0) {
+                buff_index += j;
+            } else {
+                MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                exit(EXIT_FAILURE);
+            }
+
+            /* Packet RX time (GPS based), 37 useful chars */
+            if (ref_ok == true) {
+                /* convert packet timestamp to UTC absolute time */
+                j = lgw_cnt2utc(local_ref, p->count_us, &pkt_utc_time);
+                if (j == LGW_GPS_SUCCESS) {
+                    /* split the UNIX timestamp to its calendar components */
+                    x = gmtime(&(pkt_utc_time.tv_sec));
+                    j = snprintf((char *)(buff_up + buff_index), TX_BUFF_SIZE-buff_index, ",\"time\":\"%04i-%02i-%02iT%02i:%02i:%02i.%06liZ\"", (x->tm_year)+1900, (x->tm_mon)+1, x->tm_mday, x->tm_hour, x->tm_min, x->tm_sec, (pkt_utc_time.tv_nsec)/1000); /* ISO 8601 format */
+                    if (j > 0) {
+                        buff_index += j;
+                    } else {
+                        MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                        exit(EXIT_FAILURE);
+                    }
+                }
+                /* convert packet timestamp to GPS absolute time */
+                j = lgw_cnt2gps(local_ref, p->count_us, &pkt_gps_time);
+                if (j == LGW_GPS_SUCCESS) {
+                    pkt_gps_time_ms = pkt_gps_time.tv_sec * 1E3 + pkt_gps_time.tv_nsec / 1E6;
+                    j = snprintf((char *)(buff_up + buff_index), TX_BUFF_SIZE-buff_index, ",\"tmms\":%" PRIu64 "", pkt_gps_time_ms); /* GPS time in milliseconds since 06.Jan.1980 */
+                    if (j > 0) {
+                        buff_index += j;
+                    } else {
+                        MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                        exit(EXIT_FAILURE);
+                    }
+                }
+            }
+
+            /* Packet concentrator channel, RF chain & RX frequency, 34-36 useful chars */
+            j = snprintf((char *)(buff_up + buff_index), TX_BUFF_SIZE-buff_index, ",\"chan\":%1u,\"rfch\":%1u,\"freq\":%.6lf,\"mid\":%2u", p->if_chain, p->rf_chain, ((double)p->freq_hz / 1e6), p->modem_id);
+            if (j > 0) {
+                buff_index += j;
+            } else {
+                MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                exit(EXIT_FAILURE);
+            }
+
+            /* Packet status, 9-10 useful chars */
+            switch (p->status) {
+                case STAT_CRC_OK:
+                    memcpy((void *)(buff_up + buff_index), (void *)",\"stat\":1", 9);
+                    buff_index += 9;
+                    break;
+                case STAT_CRC_BAD:
+                    memcpy((void *)(buff_up + buff_index), (void *)",\"stat\":-1", 10);
+                    buff_index += 10;
+                    break;
+                case STAT_NO_CRC:
+                    memcpy((void *)(buff_up + buff_index), (void *)",\"stat\":0", 9);
+                    buff_index += 9;
+                    break;
+                default:
+                    MSG("ERROR: [up] received packet with unknown status 0x%02X\n", p->status);
+                    memcpy((void *)(buff_up + buff_index), (void *)",\"stat\":?", 9);
+                    buff_index += 9;
+                    exit(EXIT_FAILURE);
+            }
+
+            /* Packet modulation, 13-14 useful chars */
+            if (p->modulation == MOD_LORA) {
+                memcpy((void *)(buff_up + buff_index), (void *)",\"modu\":\"LORA\"", 14);
+                buff_index += 14;
+
+                /* Lora datarate & bandwidth, 16-19 useful chars */
+                switch (p->datarate) {
+                    case DR_LORA_SF5:
+                        memcpy((void *)(buff_up + buff_index), (void *)",\"datr\":\"SF5", 12);
+                        buff_index += 12;
+                        break;
+                    case DR_LORA_SF6:
+                        memcpy((void *)(buff_up + buff_index), (void *)",\"datr\":\"SF6", 12);
+                        buff_index += 12;
+                        break;
+                    case DR_LORA_SF7:
+                        memcpy((void *)(buff_up + buff_index), (void *)",\"datr\":\"SF7", 12);
+                        buff_index += 12;
+                        break;
+                    case DR_LORA_SF8:
+                        memcpy((void *)(buff_up + buff_index), (void *)",\"datr\":\"SF8", 12);
+                        buff_index += 12;
+                        break;
+                    case DR_LORA_SF9:
+                        memcpy((void *)(buff_up + buff_index), (void *)",\"datr\":\"SF9", 12);
+                        buff_index += 12;
+                        break;
+                    case DR_LORA_SF10:
+                        memcpy((void *)(buff_up + buff_index), (void *)",\"datr\":\"SF10", 13);
+                        buff_index += 13;
+                        break;
+                    case DR_LORA_SF11:
+                        memcpy((void *)(buff_up + buff_index), (void *)",\"datr\":\"SF11", 13);
+                        buff_index += 13;
+                        break;
+                    case DR_LORA_SF12:
+                        memcpy((void *)(buff_up + buff_index), (void *)",\"datr\":\"SF12", 13);
+                        buff_index += 13;
+                        break;
+                    default:
+                        MSG("ERROR: [up] lora packet with unknown datarate 0x%02X\n", p->datarate);
+                        memcpy((void *)(buff_up + buff_index), (void *)",\"datr\":\"SF?", 12);
+                        buff_index += 12;
+                        exit(EXIT_FAILURE);
+                }
+                switch (p->bandwidth) {
+                    case BW_125KHZ:
+                        memcpy((void *)(buff_up + buff_index), (void *)"BW125\"", 6);
+                        buff_index += 6;
+                        break;
+                    case BW_250KHZ:
+                        memcpy((void *)(buff_up + buff_index), (void *)"BW250\"", 6);
+                        buff_index += 6;
+                        break;
+                    case BW_500KHZ:
+                        memcpy((void *)(buff_up + buff_index), (void *)"BW500\"", 6);
+                        buff_index += 6;
+                        break;
+                    default:
+                        MSG("ERROR: [up] lora packet with unknown bandwidth 0x%02X\n", p->bandwidth);
+                        memcpy((void *)(buff_up + buff_index), (void *)"BW?\"", 4);
+                        buff_index += 4;
+                        exit(EXIT_FAILURE);
+                }
+
+                /* Packet ECC coding rate, 11-13 useful chars */
+                switch (p->coderate) {
+                    case CR_LORA_4_5:
+                        memcpy((void *)(buff_up + buff_index), (void *)",\"codr\":\"4/5\"", 13);
+                        buff_index += 13;
+                        break;
+                    case CR_LORA_4_6:
+                        memcpy((void *)(buff_up + buff_index), (void *)",\"codr\":\"4/6\"", 13);
+                        buff_index += 13;
+                        break;
+                    case CR_LORA_4_7:
+                        memcpy((void *)(buff_up + buff_index), (void *)",\"codr\":\"4/7\"", 13);
+                        buff_index += 13;
+                        break;
+                    case CR_LORA_4_8:
+                        memcpy((void *)(buff_up + buff_index), (void *)",\"codr\":\"4/8\"", 13);
+                        buff_index += 13;
+                        break;
+                    case 0: /* treat the CR0 case (mostly false sync) */
+                        memcpy((void *)(buff_up + buff_index), (void *)",\"codr\":\"OFF\"", 13);
+                        buff_index += 13;
+                        break;
+                    default:
+                        MSG("ERROR: [up] lora packet with unknown coderate 0x%02X\n", p->coderate);
+                        memcpy((void *)(buff_up + buff_index), (void *)",\"codr\":\"?\"", 11);
+                        buff_index += 11;
+                        exit(EXIT_FAILURE);
+                }
+
+                /* Signal RSSI, payload size */
+                j = snprintf((char *)(buff_up + buff_index), TX_BUFF_SIZE-buff_index, ",\"rssis\":%.0f", roundf(p->rssis));
+                if (j > 0) {
+                    buff_index += j;
+                } else {
+                    MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                    exit(EXIT_FAILURE);
+                }
+
+                /* Lora SNR */
+                j = snprintf((char *)(buff_up + buff_index), TX_BUFF_SIZE-buff_index, ",\"lsnr\":%.1f", p->snr);
+                if (j > 0) {
+                    buff_index += j;
+                } else {
+                    MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                    exit(EXIT_FAILURE);
+                }
+
+                /* Lora frequency offset */
+                j = snprintf((char *)(buff_up + buff_index), TX_BUFF_SIZE-buff_index, ",\"foff\":%d", p->freq_offset);
+                if (j > 0) {
+                    buff_index += j;
+                } else {
+                    MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                    exit(EXIT_FAILURE);
+                }
+            } else if (p->modulation == MOD_FSK) {
+                memcpy((void *)(buff_up + buff_index), (void *)",\"modu\":\"FSK\"", 13);
+                buff_index += 13;
+
+                /* FSK datarate, 11-14 useful chars */
+                j = snprintf((char *)(buff_up + buff_index), TX_BUFF_SIZE-buff_index, ",\"datr\":%u", p->datarate);
+                if (j > 0) {
+                    buff_index += j;
+                } else {
+                    MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                    exit(EXIT_FAILURE);
+                }
+            } else {
+                MSG("ERROR: [up] received packet with unknown modulation 0x%02X\n", p->modulation);
+                exit(EXIT_FAILURE);
+            }
+
+            /* Channel RSSI, payload size, 18-23 useful chars */
+            j = snprintf((char *)(buff_up + buff_index), TX_BUFF_SIZE-buff_index, ",\"rssi\":%.0f,\"size\":%u", roundf(p->rssic), p->size);
+            if (j > 0) {
+                buff_index += j;
+            } else {
+                MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 4));
+                exit(EXIT_FAILURE);
+            }
+
+            /* Packet base64-encoded payload, 14-350 useful chars */
+            memcpy((void *)(buff_up + buff_index), (void *)",\"data\":\"", 9);
+            buff_index += 9;
+            j = bin_to_b64(p->payload, p->size, (char *)(buff_up + buff_index), 341); /* 255 bytes = 340 chars in b64 + null char */
+            if (j>=0) {
+                buff_index += j;
+            } else {
+                MSG("ERROR: [up] bin_to_b64 failed line %u\n", (__LINE__ - 5));
+                exit(EXIT_FAILURE);
+            }
+            buff_up[buff_index] = '"';
+            ++buff_index;
+
+            /* End of packet serialization */
+            buff_up[buff_index] = '}';
+            ++buff_index;
+            ++pkt_in_dgram;
+
+            if (p->modulation == MOD_LORA) {
+                /* Log nb of packets per channel, per SF */
+                nb_pkt_log[p->if_chain][p->datarate - 5] += 1;
+                nb_pkt_received_lora += 1;
+
+                /* Log nb of packets for ref_payload (DEBUG) */
+                for (k = 0; k < debugconf.nb_ref_payload; k++) {
+                    if ((p->payload[0] == (uint8_t)(debugconf.ref_payload[k].id >> 24)) &&
+                        (p->payload[1] == (uint8_t)(debugconf.ref_payload[k].id >> 16)) &&
+                        (p->payload[2] == (uint8_t)(debugconf.ref_payload[k].id >> 8))  &&
+                        (p->payload[3] == (uint8_t)(debugconf.ref_payload[k].id >> 0))) {
+                            nb_pkt_received_ref[k] += 1;
+                        }
+                }
+            } else if (p->modulation == MOD_FSK) {
+                nb_pkt_log[p->if_chain][0] += 1;
+                nb_pkt_received_fsk += 1;
+            }
+        }
+
+
+        /* DEBUG: print the number of packets received per channel and per SF */
+        {
+            int l, m;
+            MSG_PRINTF(DEBUG_PKT_FWD, "\n");
+            for (l = 0; l < (LGW_IF_CHAIN_NB - 1); l++) {
+                MSG_PRINTF(DEBUG_PKT_FWD, "CH%d: ", l);
+                for (m = 0; m < 8; m++) {
+                    MSG_PRINTF(DEBUG_PKT_FWD, "\t%d", nb_pkt_log[l][m]);
+                }
+                MSG_PRINTF(DEBUG_PKT_FWD, "\n");
+            }
+            MSG_PRINTF(DEBUG_PKT_FWD, "FSK: \t%d", nb_pkt_log[9][0]);
+            MSG_PRINTF(DEBUG_PKT_FWD, "\n");
+            MSG_PRINTF(DEBUG_PKT_FWD, "Total number of LoRa packet received: %u\n", nb_pkt_received_lora);
+            MSG_PRINTF(DEBUG_PKT_FWD, "Total number of FSK packet received: %u\n", nb_pkt_received_fsk);
+            for (l = 0; l < debugconf.nb_ref_payload; l++) {
+                MSG_PRINTF(DEBUG_PKT_FWD, "Total number of LoRa packet received from 0x%08X: %u\n", debugconf.ref_payload[l].id, nb_pkt_received_ref[l]);
+            }
+        }
+
+        /* restart fetch sequence without sending empty JSON if all packets have been filtered out */
+        if (pkt_in_dgram == 0) {
+            if (send_report == true) {
+                /* need to clean up the beginning of the payload */
+                buff_index -= 8; /* removes "rxpk":[ */
+            } else {
+                /* all packet have been filtered out and no report, restart loop */
+                continue;
+            }
+        } else {
+            /* end of packet array */
+            buff_up[buff_index] = ']';
+            ++buff_index;
+            /* add separator if needed */
+            if (send_report == true) {
+                buff_up[buff_index] = ',';
+                ++buff_index;
+            }
+        }
+
+        /* add status report if a new one is available */
+        if (send_report == true) {
+            pthread_mutex_lock(&mx_stat_rep);
+            report_ready = false;
+            j = snprintf((char *)(buff_up + buff_index), TX_BUFF_SIZE-buff_index, "%s", status_report);
+            pthread_mutex_unlock(&mx_stat_rep);
+            if (j > 0) {
+                buff_index += j;
+            } else {
+                MSG("ERROR: [up] snprintf failed line %u\n", (__LINE__ - 5));
+                exit(EXIT_FAILURE);
+            }
+        }
+
+        /* end of JSON datagram payload */
+        buff_up[buff_index] = '}';
+        ++buff_index;
+        buff_up[buff_index] = 0; /* add string terminator, for safety */
+
+        printf("\nJSON up: %s\n", (char *)(buff_up + 12)); /* DEBUG: display JSON payload */
+
+        //buff_up to txpkt
+
+        /* insert packet to be sent into JIT queue */
+        if (jit_result == JIT_ERROR_OK) {
+            pthread_mutex_lock(&mx_concent);
+            lgw_get_instcnt(&current_concentrator_time);
+            pthread_mutex_unlock(&mx_concent);
+            jit_result = jit_enqueue(&jit_queue[txpkt.rf_chain], current_concentrator_time, &txpkt, downlink_type);
+            if (jit_result != JIT_ERROR_OK) {
+                printf("ERROR: Packet REJECTED (jit error=%d)\n", jit_result);
+            } else {
+                /* In case of a warning having been raised before, we notify it */
+                jit_result = warning_result;
+            }
+            pthread_mutex_lock(&mx_meas_dw);
+            meas_nb_tx_requested += 1;
+            pthread_mutex_unlock(&mx_meas_dw);
+        }
+
+    MSG("\nINFO: End of relay thread\n");
+}
+
+/* -------------------------------------------------------------------------- */
+/* --- THREAD 5: PARSE GPS MESSAGE AND KEEP GATEWAY IN SYNC ----------------- */
 
 static void gps_process_sync(void) {
     struct timespec gps_time;
@@ -3222,7 +3732,7 @@ void thread_gps(void) {
 }
 
 /* -------------------------------------------------------------------------- */
-/* --- THREAD 5: CHECK TIME REFERENCE AND CALCULATE XTAL CORRECTION --------- */
+/* --- THREAD 6: CHECK TIME REFERENCE AND CALCULATE XTAL CORRECTION --------- */
 
 void thread_valid(void) {
 
